@@ -1,0 +1,14 @@
+{
+  "name": "wabot-larom",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bot de WhatsApp (IA FAQ) para negocios de turnos - AmigoEmprende",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest",
+    "express": "latest"
+  }
+}
