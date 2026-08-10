@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
-    "express": "latest"
+    "express": "latest",
+    "redis": "latest"
   }
 }
