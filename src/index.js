@@ -25,6 +25,14 @@ const REDIS_URL = process.env.REDIS_URL || ""; // vacío = sin memoria (fallback
 const HISTORY_MAX = parseInt(process.env.HISTORY_MAX || "12", 10); // mensajes guardados por chat
 const HISTORY_TTL = parseInt(process.env.HISTORY_TTL_SECONDS || "28800", 10); // 8 hs
 
+// Recordatorios (ladrillo 2): el bot consulta la web de turnos y avisa 2h antes
+const TURNOS_API_URL = process.env.TURNOS_API_URL || "http://larom_turnos:3000";
+const BOT_API_SECRET = process.env.BOT_API_SECRET || "";
+const REC2H_ENABLED = (process.env.REC2H_ENABLED || "true") !== "false";
+const REC2H_MIN = parseInt(process.env.REC2H_MIN || "110", 10); // ventana desde (min)
+const REC2H_MAX = parseInt(process.env.REC2H_MAX || "130", 10); // ventana hasta (min)
+const REC2H_POLL_MS = parseInt(process.env.REC2H_POLL_SECONDS || "300", 10) * 1000; // cada 5 min
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ── Redis (memoria por conversación) ─────────────────────────────────────────
@@ -122,6 +130,72 @@ async function responderIA(historial, pregunta) {
     .trim();
 }
 
+// ── Normalizar teléfono argentino a formato WhatsApp (549XXXXXXXXXX) ──────────
+// Best-effort: el número lo carga el cliente al reservar. El ladrillo de
+// confirmación al reservar validará que sea real.
+function normalizarTelefono(raw) {
+  let d = String(raw || "").replace(/[^0-9]/g, "");
+  if (!d) return null;
+  if (d.startsWith("00")) d = d.slice(2);
+  if (d.startsWith("54")) {
+    // ya tiene código país; asegurar el 9 de celular
+    let resto = d.slice(2);
+    if (!resto.startsWith("9")) resto = "9" + resto;
+    return "54" + resto;
+  }
+  // sin código país: asumo Argentina, agrego 549
+  if (d.startsWith("9")) return "54" + d;
+  return "549" + d;
+}
+
+// ── Dedup de recordatorios ya enviados (Redis; fallback en memoria) ──────────
+const recordadosMem = new Set();
+async function yaRecordado(turnoId) {
+  const key = `wabot:rec2h:${EVOLUTION_INSTANCE}:${turnoId}`;
+  if (redis?.isReady) {
+    try {
+      const set = await redis.set(key, "1", { NX: true, EX: 86400 });
+      return set === null; // null = ya existía => ya recordado
+    } catch (e) {
+      console.error("[redis] dedup:", e?.message || e);
+    }
+  }
+  if (recordadosMem.has(turnoId)) return true;
+  recordadosMem.add(turnoId);
+  return false;
+}
+
+// ── Chequear turnos próximos y mandar recordatorio 2h ────────────────────────
+async function chequearRecordatorios() {
+  if (!REC2H_ENABLED || !BOT_API_SECRET) return;
+  try {
+    const res = await fetch(`${TURNOS_API_URL}/api/bot/turnos?horas=3`, {
+      headers: { "x-bot-secret": BOT_API_SECRET },
+    });
+    if (!res.ok) {
+      console.error(`[rec2h] API turnos ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    const ahora = Date.now();
+    for (const t of data.turnos || []) {
+      const mins = (t.inicioEpochMs - ahora) / 60000;
+      if (mins < REC2H_MIN || mins > REC2H_MAX) continue;
+      if (await yaRecordado(t.id)) continue;
+      const numero = normalizarTelefono(t.telefono);
+      if (!numero) continue;
+      const nombre = (t.nombre || "").split(" ")[0] || "";
+      const texto =
+        `Hola ${nombre}! 👋 Te recordamos tu turno en ${NEGOCIO_NOMBRE} hoy a las ${t.hora} (${t.servicio}) con ${t.barbero}. ` +
+        `Si no podés venir, podés cancelarlo gratis hasta 30 minutos antes. ¡Te esperamos!`;
+      console.log(`[rec2h] enviando a ${numero} (turno ${t.id}, ${t.hora})`);
+      await enviarWhatsapp(numero, texto);
+    }
+  } catch (e) {
+    console.error("[rec2h] error:", e?.message || e);
+  }
+}
+
 // ── Servidor ─────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -177,4 +251,11 @@ app.post("/webhook", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`wabot escuchando en :${PORT} | instancia=${EVOLUTION_INSTANCE} | modelo=${MODEL}`);
+  if (REC2H_ENABLED && BOT_API_SECRET) {
+    console.log(`[rec2h] recordatorios 2h activos (cada ${REC2H_POLL_MS / 1000}s)`);
+    setInterval(chequearRecordatorios, REC2H_POLL_MS);
+    setTimeout(chequearRecordatorios, 15000); // una corrida al arranque
+  } else {
+    console.log("[rec2h] recordatorios 2h desactivados (falta BOT_API_SECRET o REC2H_ENABLED=false)");
+  }
 });
