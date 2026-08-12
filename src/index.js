@@ -33,6 +33,11 @@ const REC2H_MIN = parseInt(process.env.REC2H_MIN || "110", 10); // ventana desde
 const REC2H_MAX = parseInt(process.env.REC2H_MAX || "130", 10); // ventana hasta (min)
 const REC2H_POLL_MS = parseInt(process.env.REC2H_POLL_SECONDS || "300", 10) * 1000; // cada 5 min
 
+// Confirmación al reservar (ladrillo 3a)
+const CONFIRM_ENABLED = (process.env.CONFIRM_ENABLED || "true") !== "false";
+const CONFIRM_WINDOW_MIN = parseInt(process.env.CONFIRM_WINDOW_MIN || "20", 10);
+const CONFIRM_POLL_MS = parseInt(process.env.CONFIRM_POLL_SECONDS || "60", 10) * 1000; // cada 1 min
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ── Redis (memoria por conversación) ─────────────────────────────────────────
@@ -196,6 +201,96 @@ async function chequearRecordatorios() {
   }
 }
 
+// ── Confirmación al reservar (ladrillo 3a) ───────────────────────────────────
+function esAfirmativo(t) {
+  return /^\s*(si|sí|s|dale|ok|oka|okey|listo|confirmo|confirmar|va|vale|perfecto|sip|obvio)\b/i.test(t);
+}
+function esNegativo(t) {
+  return /^\s*(no|nop|cancelar|cancela|cancelalo|cancelá|negativo)\b/i.test(t);
+}
+
+const pendKey = (numero) => `wabot:pendconf:${EVOLUTION_INSTANCE}:${numero}`;
+async function getPendConf(numero) {
+  if (!redis?.isReady) return null;
+  try { return await redis.get(pendKey(numero)); } catch { return null; }
+}
+async function setPendConf(numero, id) {
+  if (!redis?.isReady) return;
+  try { await redis.set(pendKey(numero), String(id), { EX: CONFIRM_WINDOW_MIN * 60 + 120 }); } catch {}
+}
+async function clearPendConf(numero) {
+  if (!redis?.isReady) return;
+  try { await redis.del(pendKey(numero)); } catch {}
+}
+async function notifiedConf(id) {
+  if (!redis?.isReady) return true; // sin Redis no mandamos (evita spam)
+  try {
+    const s = await redis.set(`wabot:confnotif:${EVOLUTION_INSTANCE}:${id}`, "1", { NX: true, EX: 3600 });
+    return s === null; // null = ya avisado
+  } catch { return true; }
+}
+
+async function accionTurno(id, accion) {
+  try {
+    const res = await fetch(`${TURNOS_API_URL}/api/bot/accion`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-bot-secret": BOT_API_SECRET },
+      body: JSON.stringify({ id: Number(id), accion }),
+    });
+    if (!res.ok) return { ok: false };
+    return await res.json();
+  } catch (e) {
+    console.error("[conf] accion:", e?.message || e);
+    return { ok: false };
+  }
+}
+
+async function chequearConfirmaciones() {
+  if (!CONFIRM_ENABLED || !BOT_API_SECRET || !redis?.isReady) return;
+  try {
+    const res = await fetch(`${TURNOS_API_URL}/api/bot/pendientes`, {
+      headers: { "x-bot-secret": BOT_API_SECRET },
+    });
+    if (!res.ok) {
+      console.error(`[conf] API pendientes ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    const now = Date.now();
+    for (const t of data.pendientes || []) {
+      const numero = normalizarTelefono(t.telefono);
+      if (!numero) continue;
+      const ageMin = (now - t.creadoEnEpochMs) / 60000;
+
+      if (ageMin > CONFIRM_WINDOW_MIN) {
+        const r = await accionTurno(t.id, "expirar");
+        if (r?.ok) {
+          console.log(`[conf] expirado turno ${t.id}`);
+          await clearPendConf(numero);
+          await enviarWhatsapp(
+            numero,
+            `No confirmaste tu turno en ${NEGOCIO_NOMBRE}, así que quedó liberado. Si querés, sacá otro desde ${WEB_RESERVAS}.`,
+          );
+        }
+        continue;
+      }
+
+      if (await notifiedConf(t.id)) continue; // ya le mandamos la confirmación
+      const nombre = (t.nombre || "").split(" ")[0] || "";
+      const partes = t.fecha.split("-");
+      const fechaLinda = `${partes[2]}/${partes[1]}`;
+      const texto =
+        `Hola ${nombre}! 👋 Registraste un turno en ${NEGOCIO_NOMBRE} para el ${fechaLinda} a las ${t.hora} (${t.servicio}). ` +
+        `Para confirmarlo respondé SÍ dentro de los ${CONFIRM_WINDOW_MIN} minutos. Si no confirmás, el turno se libera. (Respondé NO para cancelarlo.)`;
+      console.log(`[conf] enviando confirmacion a ${numero} (turno ${t.id})`);
+      await enviarWhatsapp(numero, texto);
+      await setPendConf(numero, t.id);
+    }
+  } catch (e) {
+    console.error("[conf] error:", e?.message || e);
+  }
+}
+
 // ── Servidor ─────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -224,6 +319,31 @@ app.post("/webhook", async (req, res) => {
       const numero = jid.split("@")[0];
       const pregunta = texto.trim();
       console.log(`[msg] ${numero}: ${pregunta.slice(0, 120)}`);
+
+      // ¿Este número tiene un turno esperando confirmación? (ladrillo 3a)
+      const pendId = await getPendConf(numero);
+      if (pendId) {
+        if (esAfirmativo(pregunta)) {
+          const r = await accionTurno(pendId, "confirmar");
+          await clearPendConf(numero);
+          await enviarWhatsapp(
+            numero,
+            r?.ok
+              ? "¡Listo! Tu turno quedó confirmado ✅. ¡Te esperamos!"
+              : "Ese turno ya no estaba disponible para confirmar. Si querés, sacá uno nuevo desde la web.",
+          );
+        } else if (esNegativo(pregunta)) {
+          await accionTurno(pendId, "expirar");
+          await clearPendConf(numero);
+          await enviarWhatsapp(numero, "Listo, cancelamos el turno. Cuando quieras sacás otro desde la web. 🙌");
+        } else {
+          await enviarWhatsapp(
+            numero,
+            "Para confirmar tu turno respondé SÍ dentro del tiempo. (O NO si querés cancelarlo.)",
+          );
+        }
+        continue; // no pasar a las FAQs mientras hay confirmación pendiente
+      }
 
       try {
         const historial = await cargarHistorial(numero);
@@ -257,5 +377,12 @@ app.listen(PORT, "0.0.0.0", () => {
     setTimeout(chequearRecordatorios, 15000); // una corrida al arranque
   } else {
     console.log("[rec2h] recordatorios 2h desactivados (falta BOT_API_SECRET o REC2H_ENABLED=false)");
+  }
+  if (CONFIRM_ENABLED && BOT_API_SECRET) {
+    console.log(`[conf] confirmación al reservar activa (cada ${CONFIRM_POLL_MS / 1000}s, ventana ${CONFIRM_WINDOW_MIN} min)`);
+    setInterval(chequearConfirmaciones, CONFIRM_POLL_MS);
+    setTimeout(chequearConfirmaciones, 8000);
+  } else {
+    console.log("[conf] confirmación al reservar desactivada");
   }
 });
