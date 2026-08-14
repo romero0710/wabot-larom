@@ -279,9 +279,11 @@ async function chequearConfirmaciones() {
       const nombre = (t.nombre || "").split(" ")[0] || "";
       const partes = t.fecha.split("-");
       const fechaLinda = `${partes[2]}/${partes[1]}`;
+      const link = t.token ? `${WEB_RESERVAS}/turno/${t.token}` : WEB_RESERVAS;
       const texto =
         `Hola ${nombre}! 👋 Registraste un turno en ${NEGOCIO_NOMBRE} para el ${fechaLinda} a las ${t.hora} (${t.servicio}). ` +
-        `Para confirmarlo respondé SÍ dentro de los ${CONFIRM_WINDOW_MIN} minutos. Si no confirmás, el turno se libera. (Respondé NO para cancelarlo.)`;
+        `Para confirmarlo respondé SÍ dentro de los ${CONFIRM_WINDOW_MIN} minutos. Si no confirmás, el turno se libera.\n` +
+        `Para ver o cancelar tu turno cuando quieras: ${link}`;
       console.log(`[conf] enviando confirmacion a ${numero} (turno ${t.id})`);
       await enviarWhatsapp(numero, texto);
       await setPendConf(numero, t.id);
@@ -298,6 +300,16 @@ app.use(express.json({ limit: "2mb" }));
 app.get("/health", (_req, res) =>
   res.json({ ok: true, instance: EVOLUTION_INSTANCE, model: MODEL, memoria: !!redis?.isReady }),
 );
+
+// Empujón interno desde la web de turnos: al reservar, dispara el chequeo de
+// confirmaciones al instante (sin esperar el polling). Protegido por secreto.
+app.post("/interno/check", (req, res) => {
+  if (!BOT_API_SECRET || (req.headers["x-bot-secret"] || "") !== BOT_API_SECRET) {
+    return res.sendStatus(401);
+  }
+  res.sendStatus(200);
+  chequearConfirmaciones();
+});
 
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200); // 200 al toque; procesamos aparte
