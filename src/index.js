@@ -342,6 +342,7 @@ async function analizarComprobante(base64, mimetype, montoEsperado) {
   const resp = await anthropic.messages.create({
     model: MODEL_VISION,
     max_tokens: 300,
+    thinking: { type: "disabled" }, // extracción directa: sin pensamiento (evita gastar el presupuesto)
     messages: [
       {
         role: "user",
