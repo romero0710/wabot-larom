@@ -15,6 +15,8 @@ const EVOLUTION_APIKEY = process.env.EVOLUTION_APIKEY || "";
 const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE || "turnos-demo";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5";
+// Para leer comprobantes conviene un modelo con mejor visión/precisión que Haiku.
+const MODEL_VISION = process.env.ANTHROPIC_MODEL_VISION || "claude-sonnet-5";
 const NEGOCIO_NOMBRE = process.env.NEGOCIO_NOMBRE || "el negocio";
 const WEB_RESERVAS = process.env.WEB_RESERVAS || "https://turnos.larom.cloud";
 const NEGOCIO_INFO =
@@ -338,7 +340,7 @@ async function analizarComprobante(base64, mimetype, montoEsperado) {
     `"fecha_hora_iso": string|null (la fecha y hora EXACTA que figura en el comprobante, en formato ISO 8601 "YYYY-MM-DDTHH:MM", interpretando la hora como hora local de Argentina)}. ` +
     `Si la imagen no es un comprobante de transferencia, poné es_comprobante=false.`;
   const resp = await anthropic.messages.create({
-    model: MODEL,
+    model: MODEL_VISION,
     max_tokens: 300,
     messages: [
       {
@@ -391,7 +393,10 @@ async function procesarComprobante(numero, turnoId, montoEsperado, msg) {
   if (epoch != null) {
     const minAgo = (Date.now() - epoch) / 60000;
     console.log(`[sena] turno ${turnoId} minAgo=${minAgo.toFixed(1)} (max ${SENA_RECIENTE_MIN})`);
-    if (minAgo > SENA_RECIENTE_MIN || minAgo < -15) {
+    // Solo rechazamos si es claramente VIEJO. Una fecha "futura" suele ser un
+    // error de lectura del modelo, así que no bloqueamos por eso (el barbero
+    // valida en MercadoPago igual).
+    if (minAgo > SENA_RECIENTE_MIN) {
       await enviarWhatsapp(
         numero,
         "Ese comprobante no parece de la transferencia que acabás de hacer para este turno. Tiene que ser reciente.",
