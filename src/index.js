@@ -190,9 +190,10 @@ async function chequearRecordatorios() {
       const numero = normalizarTelefono(t.telefono);
       if (!numero) continue;
       const nombre = (t.nombre || "").split(" ")[0] || "";
+      const link = t.token ? `${WEB_RESERVAS}/turno/${t.token}` : WEB_RESERVAS;
       const texto =
         `Hola ${nombre}! 👋 Te recordamos tu turno en ${NEGOCIO_NOMBRE} hoy a las ${t.hora} (${t.servicio}) con ${t.barbero}. ` +
-        `Si no podés venir, podés cancelarlo gratis hasta 30 minutos antes. ¡Te esperamos!`;
+        `Si necesitás cancelar o reprogramar, entrá acá: ${link}\n¡Te esperamos!`;
       console.log(`[rec2h] enviando a ${numero} (turno ${t.id}, ${t.hora})`);
       await enviarWhatsapp(numero, texto);
     }
