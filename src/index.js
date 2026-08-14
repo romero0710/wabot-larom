@@ -38,6 +38,14 @@ const CONFIRM_ENABLED = (process.env.CONFIRM_ENABLED || "true") !== "false";
 const CONFIRM_WINDOW_MIN = parseInt(process.env.CONFIRM_WINDOW_MIN || "20", 10);
 const CONFIRM_POLL_MS = parseInt(process.env.CONFIRM_POLL_SECONDS || "60", 10) * 1000; // cada 1 min
 
+// Seña opcional (ladrillo 3b): si está activa, para confirmar hay que transferir
+// y mandar el comprobante (que valida la IA con visión).
+const SENA_ENABLED = (process.env.SENA_ENABLED || "false") === "true";
+const SENA_PORCENTAJE = parseInt(process.env.SENA_PORCENTAJE || "50", 10);
+const SENA_ALIAS = process.env.SENA_ALIAS || "";
+const SENA_TITULAR = process.env.SENA_TITULAR || "";
+const SENA_RECIENTE_MIN = parseInt(process.env.SENA_RECIENTE_MIN || "60", 10); // antigüedad máx del comprobante
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ── Redis (memoria por conversación) ─────────────────────────────────────────
@@ -231,12 +239,12 @@ async function notifiedConf(id) {
   } catch { return true; }
 }
 
-async function accionTurno(id, accion) {
+async function accionTurno(id, accion, senaMonto = 0) {
   try {
     const res = await fetch(`${TURNOS_API_URL}/api/bot/accion`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-bot-secret": BOT_API_SECRET },
-      body: JSON.stringify({ id: Number(id), accion }),
+      body: JSON.stringify({ id: Number(id), accion, senaMonto }),
     });
     if (!res.ok) return { ok: false };
     return await res.json();
@@ -244,6 +252,151 @@ async function accionTurno(id, accion) {
     console.error("[conf] accion:", e?.message || e);
     return { ok: false };
   }
+}
+
+// ── Seña: helpers (Redis, monto, media, visión) ──────────────────────────────
+const senaKey = (numero) => `wabot:senareq:${EVOLUTION_INSTANCE}:${numero}`;
+async function getSenaReq(numero) {
+  if (!redis?.isReady) return null;
+  try {
+    const v = await redis.get(senaKey(numero));
+    return v ? parseInt(v, 10) : null;
+  } catch {
+    return null;
+  }
+}
+async function setSenaReq(numero, monto) {
+  if (!redis?.isReady) return;
+  try {
+    await redis.set(senaKey(numero), String(monto), { EX: CONFIRM_WINDOW_MIN * 60 + 120 });
+  } catch {}
+}
+async function clearSenaReq(numero) {
+  if (!redis?.isReady) return;
+  try {
+    await redis.del(senaKey(numero));
+  } catch {}
+}
+
+function montoSena(precioArs) {
+  return Math.round((precioArs * SENA_PORCENTAJE) / 100);
+}
+
+function destinatarioCoincide(dest) {
+  if (!dest) return false;
+  const d = dest.toLowerCase();
+  const alias = SENA_ALIAS.toLowerCase();
+  if (alias && d.includes(alias)) return true;
+  // por nombre: que aparezca algún apellido/nombre del titular (palabras > 3 letras)
+  const palabras = SENA_TITULAR.toLowerCase().split(/\s+/).filter((p) => p.length > 3);
+  return palabras.some((p) => d.includes(p));
+}
+
+// Baja el base64 de una imagen desde Evolution API.
+async function bajarComprobante(msg) {
+  try {
+    const res = await fetch(`${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${EVOLUTION_INSTANCE}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
+      body: JSON.stringify({ message: { key: msg.key }, convertToMp4: false }),
+    });
+    if (!res.ok) {
+      console.error(`[sena] getBase64 ${res.status}`);
+      return null;
+    }
+    const j = await res.json();
+    const base64 = j.base64 || j.media || null;
+    const mimetype = j.mimetype || "image/jpeg";
+    return base64 ? { base64, mimetype } : null;
+  } catch (e) {
+    console.error("[sena] bajarComprobante:", e?.message || e);
+    return null;
+  }
+}
+
+// La IA lee el comprobante y devuelve datos estructurados.
+async function analizarComprobante(base64, mimetype, montoEsperado) {
+  const ahoraTexto = new Date().toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" });
+  const prompt =
+    `Sos un validador de comprobantes de transferencia (MercadoPago o bancos argentinos). ` +
+    `La fecha y hora ACTUAL es: ${ahoraTexto} (Argentina). ` +
+    `Mirá la imagen y respondé ÚNICAMENTE con un JSON válido, sin texto extra ni markdown, con estas claves: ` +
+    `{"es_comprobante": boolean, "monto": number|null (en pesos, solo el número, sin $ ni puntos de miles), ` +
+    `"destinatario": string|null (nombre o alias de QUIEN RECIBE el dinero), ` +
+    `"reciente": boolean (true si la transferencia se hizo hace menos de ${SENA_RECIENTE_MIN} minutos respecto de la fecha/hora actual)}. ` +
+    `Si la imagen no es un comprobante de transferencia, poné es_comprobante=false.`;
+  const resp = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 300,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: mimetype, data: base64 } },
+          { type: "text", text: prompt },
+        ],
+      },
+    ],
+  });
+  const txt = resp.content
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("")
+    .trim();
+  // extraer el primer bloque {...}
+  const m = txt.match(/\{[\s\S]*\}/);
+  if (!m) return { es_comprobante: false };
+  try {
+    return JSON.parse(m[0]);
+  } catch {
+    return { es_comprobante: false };
+  }
+}
+
+// Procesa un comprobante recibido para un turno pendiente con seña.
+async function procesarComprobante(numero, turnoId, montoEsperado, msg) {
+  const media = await bajarComprobante(msg);
+  if (!media) {
+    await enviarWhatsapp(numero, "No pude descargar tu comprobante 😕. Probá reenviarlo, por favor.");
+    return;
+  }
+  let datos;
+  try {
+    datos = await analizarComprobante(media.base64, media.mimetype, montoEsperado);
+  } catch (e) {
+    console.error("[sena] visión:", e?.message || e);
+    await enviarWhatsapp(numero, "No pude leer bien el comprobante. Mandá una captura más clara, por favor.");
+    return;
+  }
+  console.log(`[sena] turno ${turnoId} analisis:`, JSON.stringify(datos).slice(0, 200));
+
+  if (!datos.es_comprobante) {
+    await enviarWhatsapp(numero, "Eso no parece un comprobante de transferencia. Mandá la captura de la transferencia, por favor.");
+    return;
+  }
+  if (!datos.reciente) {
+    await enviarWhatsapp(numero, "Ese comprobante no parece reciente. Tiene que ser de la transferencia que acabás de hacer para este turno.");
+    return;
+  }
+  if (!destinatarioCoincide(datos.destinatario)) {
+    await enviarWhatsapp(numero, `El comprobante no figura a nombre del destinatario correcto. La transferencia tiene que ir al alias ${SENA_ALIAS}.`);
+    return;
+  }
+  const monto = Number(datos.monto) || 0;
+  if (monto < montoEsperado) {
+    await enviarWhatsapp(numero, `El monto no alcanza: la seña es de $${montoEsperado} y el comprobante muestra $${monto}. Revisá, por favor.`);
+    return;
+  }
+  // Todo OK → confirmar con seña
+  const r = await accionTurno(turnoId, "confirmar", montoEsperado);
+  await clearPendConf(numero);
+  await clearSenaReq(numero);
+  await enviarWhatsapp(
+    numero,
+    r?.ok
+      ? `¡Listo! Recibimos tu seña de $${montoEsperado} y tu turno quedó confirmado ✅. ¡Te esperamos!`
+      : "Recibí tu comprobante, pero el turno ya no estaba disponible. Escribinos y lo vemos.",
+  );
 }
 
 async function chequearConfirmaciones() {
@@ -268,6 +421,7 @@ async function chequearConfirmaciones() {
         if (r?.ok) {
           console.log(`[conf] expirado turno ${t.id}`);
           await clearPendConf(numero);
+          await clearSenaReq(numero);
           await enviarWhatsapp(
             numero,
             `No confirmaste tu turno en ${NEGOCIO_NOMBRE}, así que quedó liberado. Si querés, sacá otro desde ${WEB_RESERVAS}.`,
@@ -281,11 +435,23 @@ async function chequearConfirmaciones() {
       const partes = t.fecha.split("-");
       const fechaLinda = `${partes[2]}/${partes[1]}`;
       const link = t.token ? `${WEB_RESERVAS}/turno/${t.token}` : WEB_RESERVAS;
-      const texto =
-        `Hola ${nombre}! 👋 Registraste un turno en ${NEGOCIO_NOMBRE} para el ${fechaLinda} a las ${t.hora} (${t.servicio}). ` +
-        `Para confirmarlo respondé SÍ dentro de los ${CONFIRM_WINDOW_MIN} minutos. Si no confirmás, el turno se libera.\n` +
-        `Para ver o cancelar tu turno cuando quieras: ${link}`;
-      console.log(`[conf] enviando confirmacion a ${numero} (turno ${t.id})`);
+
+      const conSena = SENA_ENABLED && SENA_ALIAS && t.precioArs > 0;
+      let texto;
+      if (conSena) {
+        const monto = montoSena(t.precioArs);
+        texto =
+          `Hola ${nombre}! 👋 Registraste un turno en ${NEGOCIO_NOMBRE} para el ${fechaLinda} a las ${t.hora} (${t.servicio}). ` +
+          `Para confirmarlo, transferí la seña de $${monto} (${SENA_PORCENTAJE}% del servicio) al alias ${SENA_ALIAS} y mandá la captura del comprobante acá, dentro de los ${CONFIRM_WINDOW_MIN} minutos. ` +
+          `Si no lo hacés, el turno se libera.\nPara ver o cancelar tu turno: ${link}`;
+        await setSenaReq(numero, monto);
+      } else {
+        texto =
+          `Hola ${nombre}! 👋 Registraste un turno en ${NEGOCIO_NOMBRE} para el ${fechaLinda} a las ${t.hora} (${t.servicio}). ` +
+          `Para confirmarlo respondé SÍ dentro de los ${CONFIRM_WINDOW_MIN} minutos. Si no confirmás, el turno se libera.\n` +
+          `Para ver o cancelar tu turno cuando quieras: ${link}`;
+      }
+      console.log(`[conf] enviando confirmacion a ${numero} (turno ${t.id})${conSena ? " [seña]" : ""}`);
       await enviarWhatsapp(numero, texto);
       await setPendConf(numero, t.id);
     }
@@ -326,16 +492,36 @@ app.post("/webhook", async (req, res) => {
       const jid = msg.key.remoteJid || "";
       if (jid.endsWith("@g.us")) continue; // ignorar grupos
 
-      const texto = extraerTexto(msg);
-      if (!texto || !texto.trim()) continue;
-
       const numero = jid.split("@")[0];
-      const pregunta = texto.trim();
-      console.log(`[msg] ${numero}: ${pregunta.slice(0, 120)}`);
+      const texto = extraerTexto(msg);
+      const esImagen = !!msg.message?.imageMessage;
+      const pregunta = (texto || "").trim();
 
-      // ¿Este número tiene un turno esperando confirmación? (ladrillo 3a)
+      // ¿Este número tiene un turno esperando confirmación? (ladrillo 3a/3b)
       const pendId = await getPendConf(numero);
       if (pendId) {
+        const senaMonto = await getSenaReq(numero);
+        if (senaMonto) {
+          // Flujo con seña (3b): se confirma mandando el comprobante (imagen).
+          if (esImagen) {
+            console.log(`[sena] comprobante de ${numero} (turno ${pendId})`);
+            await procesarComprobante(numero, pendId, senaMonto, msg);
+          } else if (pregunta && esNegativo(pregunta)) {
+            await accionTurno(pendId, "expirar");
+            await clearPendConf(numero);
+            await clearSenaReq(numero);
+            await enviarWhatsapp(numero, "Listo, cancelamos el turno. Cuando quieras sacás otro desde la web. 🙌");
+          } else {
+            await enviarWhatsapp(
+              numero,
+              `Para confirmar el turno, transferí la seña de $${senaMonto} al alias ${SENA_ALIAS} y mandá la captura del comprobante acá. (O respondé NO para cancelar.)`,
+            );
+          }
+          continue;
+        }
+        // Flujo sin seña (3a): SÍ/NO por texto.
+        if (!pregunta) continue; // imagen sin seña → ignorar
+        console.log(`[msg] ${numero}: ${pregunta.slice(0, 120)}`);
         if (esAfirmativo(pregunta)) {
           const r = await accionTurno(pendId, "confirmar");
           await clearPendConf(numero);
@@ -350,14 +536,14 @@ app.post("/webhook", async (req, res) => {
           await clearPendConf(numero);
           await enviarWhatsapp(numero, "Listo, cancelamos el turno. Cuando quieras sacás otro desde la web. 🙌");
         } else {
-          await enviarWhatsapp(
-            numero,
-            "Para confirmar tu turno respondé SÍ dentro del tiempo. (O NO si querés cancelarlo.)",
-          );
+          await enviarWhatsapp(numero, "Para confirmar tu turno respondé SÍ dentro del tiempo. (O NO si querés cancelarlo.)");
         }
-        continue; // no pasar a las FAQs mientras hay confirmación pendiente
+        continue;
       }
 
+      // Sin confirmación pendiente → FAQ (solo texto).
+      if (!pregunta) continue;
+      console.log(`[msg] ${numero}: ${pregunta.slice(0, 120)}`);
       try {
         const historial = await cargarHistorial(numero);
         const respuesta = await responderIA(historial, pregunta);
