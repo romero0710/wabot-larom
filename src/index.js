@@ -314,16 +314,28 @@ async function bajarComprobante(msg) {
   }
 }
 
-// La IA lee el comprobante y devuelve datos estructurados.
+// Convierte la fecha/hora leída del comprobante (hora local AR) a epoch ms.
+function epochDeComprobante(iso) {
+  if (!iso) return null;
+  let s = String(iso).trim().replace(" ", "T");
+  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(s)) {
+    if (/T\d\d:\d\d$/.test(s)) s += ":00";
+    s += "-03:00"; // Argentina, sin DST
+  }
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? null : t;
+}
+
+// La IA lee el comprobante y devuelve datos estructurados (solo EXTRAE; el
+// cálculo de "reciente" lo hace el código para no depender de aritmética del modelo).
 async function analizarComprobante(base64, mimetype, montoEsperado) {
-  const ahoraTexto = new Date().toLocaleString("es-AR", { timeZone: "America/Argentina/Buenos_Aires" });
   const prompt =
     `Sos un validador de comprobantes de transferencia (MercadoPago o bancos argentinos). ` +
-    `La fecha y hora ACTUAL es: ${ahoraTexto} (Argentina). ` +
     `Mirá la imagen y respondé ÚNICAMENTE con un JSON válido, sin texto extra ni markdown, con estas claves: ` +
-    `{"es_comprobante": boolean, "monto": number|null (en pesos, solo el número, sin $ ni puntos de miles), ` +
-    `"destinatario": string|null (nombre o alias de QUIEN RECIBE el dinero), ` +
-    `"reciente": boolean (true si la transferencia se hizo hace menos de ${SENA_RECIENTE_MIN} minutos respecto de la fecha/hora actual)}. ` +
+    `{"es_comprobante": boolean, ` +
+    `"monto": number|null (en pesos, solo el número entero, sin $ ni puntos de miles; ej: 10000), ` +
+    `"destinatario": string|null (nombre o alias de QUIEN RECIBE el dinero, el campo "Para"), ` +
+    `"fecha_hora_iso": string|null (la fecha y hora EXACTA que figura en el comprobante, en formato ISO 8601 "YYYY-MM-DDTHH:MM", interpretando la hora como hora local de Argentina)}. ` +
     `Si la imagen no es un comprobante de transferencia, poné es_comprobante=false.`;
   const resp = await anthropic.messages.create({
     model: MODEL,
@@ -374,9 +386,20 @@ async function procesarComprobante(numero, turnoId, montoEsperado, msg) {
     await enviarWhatsapp(numero, "Eso no parece un comprobante de transferencia. Mandá la captura de la transferencia, por favor.");
     return;
   }
-  if (!datos.reciente) {
-    await enviarWhatsapp(numero, "Ese comprobante no parece reciente. Tiene que ser de la transferencia que acabás de hacer para este turno.");
-    return;
+  // Recencia: la calculamos en código con la fecha/hora extraída del comprobante.
+  const epoch = epochDeComprobante(datos.fecha_hora_iso);
+  if (epoch != null) {
+    const minAgo = (Date.now() - epoch) / 60000;
+    console.log(`[sena] turno ${turnoId} minAgo=${minAgo.toFixed(1)} (max ${SENA_RECIENTE_MIN})`);
+    if (minAgo > SENA_RECIENTE_MIN || minAgo < -15) {
+      await enviarWhatsapp(
+        numero,
+        "Ese comprobante no parece de la transferencia que acabás de hacer para este turno. Tiene que ser reciente.",
+      );
+      return;
+    }
+  } else {
+    console.log(`[sena] turno ${turnoId}: no pude leer la fecha del comprobante, no bloqueo por recencia`);
   }
   if (!destinatarioCoincide(datos.destinatario)) {
     await enviarWhatsapp(numero, `El comprobante no figura a nombre del destinatario correcto. La transferencia tiene que ir al alias ${SENA_ALIAS}.`);
