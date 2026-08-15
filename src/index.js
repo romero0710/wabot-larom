@@ -48,6 +48,17 @@ const SENA_ALIAS = process.env.SENA_ALIAS || "";
 const SENA_TITULAR = process.env.SENA_TITULAR || "";
 const SENA_RECIENTE_MIN = parseInt(process.env.SENA_RECIENTE_MIN || "60", 10); // antigüedad máx del comprobante
 
+// Post-turno (ladrillo 4): reseña de Google + fidelización. Se manda unas horas
+// después de que terminó el turno (si el cliente no fue marcado "no vino").
+const RESENA_ENABLED = (process.env.RESENA_ENABLED || "false") === "true";
+const RESENA_URL = process.env.RESENA_URL || ""; // link de reseña de Google del negocio
+const FIDELIZACION_ENABLED = (process.env.FIDELIZACION_ENABLED || "false") === "true";
+const FIDELIZACION_META = parseInt(process.env.FIDELIZACION_META || "10", 10); // cortes para el premio
+const POSTTURNO_HORAS = parseInt(process.env.POSTTURNO_HORAS || "3", 10); // horas tras el turno
+const POSTTURNO_VENTANA_MIN = parseInt(process.env.POSTTURNO_VENTANA_MIN || "45", 10);
+const POSTTURNO_POLL_MS = parseInt(process.env.POSTTURNO_POLL_SECONDS || "900", 10) * 1000; // cada 15 min
+const POSTTURNO_ON = RESENA_ENABLED || FIDELIZACION_ENABLED;
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // ── Redis (memoria por conversación) ─────────────────────────────────────────
@@ -489,6 +500,78 @@ async function chequearConfirmaciones() {
   }
 }
 
+// ── Post-turno (ladrillo 4): reseña de Google + fidelización ─────────────────
+const postTurnoMem = new Set();
+async function yaPostTurno(turnoId) {
+  const key = `wabot:postturno:${EVOLUTION_INSTANCE}:${turnoId}`;
+  if (redis?.isReady) {
+    try {
+      const s = await redis.set(key, "1", { NX: true, EX: 259200 }); // 3 días
+      return s === null;
+    } catch (e) {
+      console.error("[post] dedup:", e?.message || e);
+    }
+  }
+  if (postTurnoMem.has(turnoId)) return true;
+  postTurnoMem.add(turnoId);
+  return false;
+}
+
+function mensajePostTurno(nombreCorto, servicio, asistidos) {
+  const hola = nombreCorto ? `Hola ${nombreCorto}!` : "¡Hola!";
+  const partes = [];
+  if (RESENA_ENABLED && RESENA_URL) {
+    partes.push(
+      `${hola} ¿Cómo estuvo tu ${servicio} en ${NEGOCIO_NOMBRE}? 🙌 ` +
+        `Si te gustó, nos ayudás un montón dejando tu reseña acá: ${RESENA_URL}`,
+    );
+  } else {
+    partes.push(`${hola} ¡Gracias por venir a ${NEGOCIO_NOMBRE}! 🙌`);
+  }
+  if (FIDELIZACION_ENABLED && FIDELIZACION_META > 0) {
+    const enCiclo = asistidos % FIDELIZACION_META;
+    if (asistidos > 0 && enCiclo === 0) {
+      partes.push(
+        `🎁 ¡Llegaste a ${FIDELIZACION_META} cortes! El próximo va de regalo. ` +
+          `Mostrale este mensaje a tu barbero cuando vengas.`,
+      );
+    } else {
+      const faltan = FIDELIZACION_META - enCiclo;
+      partes.push(
+        `💈 Ya llevás ${enCiclo}/${FIDELIZACION_META} cortes. ` +
+          (faltan === 1 ? "¡Falta 1 para el corte gratis!" : `Te faltan ${faltan} para uno gratis.`),
+      );
+    }
+  }
+  return partes.join("\n\n");
+}
+
+async function chequearPostTurno() {
+  if (!POSTTURNO_ON || !BOT_API_SECRET) return;
+  try {
+    const res = await fetch(
+      `${TURNOS_API_URL}/api/bot/postturno?horas=${POSTTURNO_HORAS}&ventanaMin=${POSTTURNO_VENTANA_MIN}`,
+      { headers: { "x-bot-secret": BOT_API_SECRET } },
+    );
+    if (!res.ok) {
+      console.error(`[post] API postturno ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    for (const t of data.turnos || []) {
+      if (await yaPostTurno(t.id)) continue;
+      const numero = normalizarTelefono(t.telefono);
+      if (!numero) continue;
+      const nombre = (t.nombre || "").split(" ")[0] || "";
+      const texto = mensajePostTurno(nombre, t.servicioNombre || "corte", t.asistidos || 0);
+      console.log(`[post] enviando a ${numero} (turno ${t.id}, asistidos ${t.asistidos})`);
+      await enviarWhatsapp(numero, texto);
+    }
+  } catch (e) {
+    console.error("[post] error:", e?.message || e);
+  }
+}
+
 // ── Servidor ─────────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -612,5 +695,15 @@ app.listen(PORT, "0.0.0.0", () => {
     setTimeout(chequearConfirmaciones, 8000);
   } else {
     console.log("[conf] confirmación al reservar desactivada");
+  }
+  if (POSTTURNO_ON && BOT_API_SECRET) {
+    console.log(
+      `[post] post-turno activo (cada ${POSTTURNO_POLL_MS / 1000}s, ${POSTTURNO_HORAS}h después` +
+        ` | reseña=${RESENA_ENABLED} fidelización=${FIDELIZACION_ENABLED} meta=${FIDELIZACION_META})`,
+    );
+    setInterval(chequearPostTurno, POSTTURNO_POLL_MS);
+    setTimeout(chequearPostTurno, 20000);
+  } else {
+    console.log("[post] post-turno desactivado (activá RESENA_ENABLED o FIDELIZACION_ENABLED)");
   }
 });
