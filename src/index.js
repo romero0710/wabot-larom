@@ -40,6 +40,11 @@ const CONFIRM_ENABLED = (process.env.CONFIRM_ENABLED || "true") !== "false";
 const CONFIRM_WINDOW_MIN = parseInt(process.env.CONFIRM_WINDOW_MIN || "20", 10);
 const CONFIRM_POLL_MS = parseInt(process.env.CONFIRM_POLL_SECONDS || "60", 10) * 1000; // cada 1 min
 
+// Aviso de "turno confirmado" (con o sin seña): mensaje con los datos + link
+// ver/cancelar. Sin seña se confirma al reservar; con seña, al pagar.
+const CONFIRMAVISO_ENABLED = (process.env.CONFIRMAVISO_ENABLED || "true") !== "false";
+const CONFIRMAVISO_POLL_MS = parseInt(process.env.CONFIRMAVISO_POLL_SECONDS || "60", 10) * 1000; // cada 1 min
+
 // Seña opcional (ladrillo 3b): si está activa, para confirmar hay que transferir
 // y mandar el comprobante (que valida la IA con visión).
 const SENA_ENABLED = (process.env.SENA_ENABLED || "false") === "true";
@@ -220,6 +225,58 @@ async function chequearRecordatorios() {
     }
   } catch (e) {
     console.error("[rec2h] error:", e?.message || e);
+  }
+}
+
+// ── Aviso de turno confirmado (con link ver/cancelar) ────────────────────────
+const avisadosConfMem = new Set();
+async function yaAvisadoConfirma(turnoId) {
+  const key = `wabot:confaviso:${EVOLUTION_INSTANCE}:${turnoId}`;
+  if (redis?.isReady) {
+    try {
+      const set = await redis.set(key, "1", { NX: true, EX: 7 * 86400 });
+      return set === null; // null = ya existía => ya avisado
+    } catch (e) {
+      console.error("[redis] dedup confaviso:", e?.message || e);
+    }
+  }
+  if (avisadosConfMem.has(turnoId)) return true;
+  avisadosConfMem.add(turnoId);
+  return false;
+}
+
+async function chequearConfirmados() {
+  if (!CONFIRMAVISO_ENABLED || !BOT_API_SECRET) return;
+  try {
+    const res = await fetch(`${TURNOS_API_URL}/api/bot/confirmados`, {
+      headers: { "x-bot-secret": BOT_API_SECRET },
+    });
+    if (!res.ok) {
+      console.error(`[confaviso] API confirmados ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    const ahora = Date.now();
+    for (const t of data.confirmados || []) {
+      if (t.inicioEpochMs < ahora) continue; // el turno ya pasó
+      if (await yaAvisadoConfirma(t.id)) continue;
+      const numero = normalizarTelefono(t.telefono);
+      if (!numero) continue;
+      const nombre = (t.nombre || "").split(" ")[0] || "";
+      const [, mes, dia] = t.fecha.split("-");
+      const link = t.token ? `${WEB_RESERVAS}/turno/${t.token}` : WEB_RESERVAS;
+      const lineaSena = t.senaMonto > 0 ? `🎫 Seña pagada: $${t.senaMonto}\n` : "";
+      const texto =
+        `¡Listo, ${nombre}! ✅ Tu turno en ${NEGOCIO_NOMBRE} quedó confirmado.\n` +
+        `💈 ${t.servicio} con ${t.barbero}\n` +
+        `📅 ${dia}/${mes} a las ${t.hora} hs\n` +
+        lineaSena +
+        `Para ver o cancelar tu turno, entrá acá: ${link}\n¡Te esperamos! 🙌`;
+      console.log(`[confaviso] enviando a ${numero} (turno ${t.id})`);
+      await enviarWhatsapp(numero, texto);
+    }
+  } catch (e) {
+    console.error("[confaviso] error:", e?.message || e);
   }
 }
 
@@ -588,6 +645,7 @@ app.post("/interno/check", (req, res) => {
   }
   res.sendStatus(200);
   chequearConfirmaciones();
+  chequearConfirmados();
 });
 
 app.post("/webhook", async (req, res) => {
@@ -695,6 +753,13 @@ app.listen(PORT, "0.0.0.0", () => {
     setTimeout(chequearConfirmaciones, 8000);
   } else {
     console.log("[conf] confirmación al reservar desactivada");
+  }
+  if (CONFIRMAVISO_ENABLED && BOT_API_SECRET) {
+    console.log(`[confaviso] aviso de turno confirmado activo (cada ${CONFIRMAVISO_POLL_MS / 1000}s)`);
+    setInterval(chequearConfirmados, CONFIRMAVISO_POLL_MS);
+    setTimeout(chequearConfirmados, 10000);
+  } else {
+    console.log("[confaviso] aviso de turno confirmado desactivado");
   }
   if (POSTTURNO_ON && BOT_API_SECRET) {
     console.log(
